@@ -252,7 +252,7 @@ func (d *Directory) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node,
 	absPath := d.path + req.Name
 
 	// Create the file in swift
-	if err := SwiftConnection.ObjectPutBytes(d.c.Name, absPath, nil, dirContentType); err != nil {
+	if err := SwiftConnection.ObjectPutBytes(d.c.Name, absPath+"/", nil, dirContentType); err != nil {
 		return nil, fuse.EIO
 	}
 
