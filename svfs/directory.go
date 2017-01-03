@@ -44,7 +44,7 @@ func (d *Directory) Attr(ctx context.Context, a *fuse.Attr) error {
 
 	if d.so != nil {
 		a.Atime = time.Now()
-		a.Mtime = getMtime(d.so, d.sh)
+		a.Mtime = MountTime
 		a.Ctime = a.Mtime
 		a.Crtime = a.Mtime
 	}
@@ -59,11 +59,15 @@ func (d *Directory) Create(ctx context.Context, req *fuse.CreateRequest, resp *f
 	path := d.path + req.Name
 
 	// New node
-	node := &Object{name: req.Name, path: path, c: d.c, cs: d.cs}
+	node := &Object{name: req.Name, path: path, c: d.c, cs: d.cs, p: d}
 
-	err := SwiftConnection.ObjectPutBytes(node.c.Name, node.path, nil, "")
-	if err != nil {
-		return nil, nil, err
+	// Don't create an empty file in transfer mode since we assume the file
+	// has been created to be immediately written to with some content.
+	if TransferMode&SkipCreate == 0 {
+		err := SwiftConnection.ObjectPutBytes(node.c.Name, node.path, nil, "")
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 
 	// Get object handler
@@ -183,7 +187,7 @@ func (d *Directory) ReadDirAll(ctx context.Context) (direntries []fuse.Dirent, e
 
 	finish:
 		// Always fetch extra info if asked
-		if child != nil && ExtraAttr {
+		if child != nil && (Attr || Xattr) {
 			directoryLister.AddTask(child, tasks)
 			child = nil
 			count++
@@ -235,7 +239,6 @@ func (d *Directory) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *f
 	if _, found := directoryCache.Peek(d.c.Name, d.path); !found {
 		d.ReadDirAll(ctx)
 	}
-
 	// Find matching child
 	if item := directoryCache.Get(d.c.Name, d.path, req.Name); item != nil {
 		if n, ok := item.(fs.Node); ok {
@@ -249,11 +252,13 @@ func (d *Directory) Lookup(ctx context.Context, req *fuse.LookupRequest, resp *f
 // Mkdir creates a new directory node within the current directory. It is represented
 // by an empty object ending with a slash in the Swift container.
 func (d *Directory) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node, error) {
-	absPath := d.path + req.Name
+	absPath := d.path + req.Name + "/"
 
 	// Create the file in swift
-	if err := SwiftConnection.ObjectPutBytes(d.c.Name, absPath, nil, dirContentType); err != nil {
-		return nil, fuse.EIO
+	if TransferMode&SkipMkdir == 0 {
+		if err := SwiftConnection.ObjectPutBytes(d.c.Name, absPath, nil, dirContentType); err != nil {
+			return nil, fuse.EIO
+		}
 	}
 
 	// Directory object
@@ -261,7 +266,7 @@ func (d *Directory) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (fs.Node,
 		c:    d.c,
 		cs:   d.cs,
 		name: req.Name,
-		path: absPath + "/",
+		path: absPath,
 		sh:   swift.Headers{},
 		so: &swift.Object{
 			Name:         absPath,
@@ -290,6 +295,15 @@ func (d *Directory) Remove(ctx context.Context, req *fuse.RemoveRequest) error {
 	)
 
 	if directory, ok := node.(*Directory); ok {
+		if TransferMode&SkipRmdir == 0 {
+			empty, err := directory.isEmpty()
+			if err != nil {
+				return err
+			}
+			if !empty {
+				return fuse.ENOTSUP
+			}
+		}
 		return d.removeDirectory(directory, req.Name)
 	}
 	if object, ok := node.(*Object); ok {
@@ -307,9 +321,28 @@ func (d *Directory) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp 
 	return nil
 }
 
+func (d *Directory) isEmpty() (bool, error) {
+	// Fetch objects
+	objects, err := SwiftConnection.ObjectsAll(d.c.Name, &swift.ObjectsOpts{
+		Delimiter: '/',
+		Prefix:    d.path,
+		Limit:     2,
+	})
+	if err != nil {
+		return false, err
+	}
+	if len(objects) > 0 {
+		for _, object := range objects {
+			if object.Name != d.path {
+				return false, nil
+			}
+		}
+	}
+	return true, nil
+}
+
 func (d *Directory) move(oldContainer, oldPath, oldName, newContainer, newPath, newName string) error {
 	// Get the old node from cache
-
 	return fuse.ENOTSUP
 }
 
@@ -340,11 +373,39 @@ func (d *Directory) moveObject(oldContainer, oldPath, oldName, newContainer, new
 }
 
 func (d *Directory) removeDirectory(directory *Directory, name string) error {
+	
+	//
+	//Uc Add - fix rename Dir - 3/1/2017
+	//
+	
+	var (
+		path = directory.path
+    )
+	
+	fmt.Println("Path is: "+path+" dirName is: "+name)
+	if _, nodes := directoryCache.GetAll(d.c.Name, path); nodes != nil {
+                for _, node := range nodes {
+                        if dir, ok := node.(*Directory); ok {
+                                //call loop
+								fmt.Println("Remove Child dir Path is: "+dir.path+" dirName is: "+dir.name)
+                                d.removeDirectory(dir, dir.name)
+                        }
+                        if object, ok := node.(*Object); ok {
+                                d.removeObject(object, object.name,object.path)
+								fmt.Println("Remove child Object: "+object.path)
+                        }
+                }
+        }
+	
+	//End Uc Add - fix rename Dir - 3/1/2017
+	
 	SwiftConnection.ObjectDelete(directory.c.Name, directory.so.Name)
+	//directoryCache.DeleteAll(directory.c.Name, directory.path)
+	
 	if _, found := directoryCache.Peek(directory.c.Name, directory.path); found {
 		directoryCache.DeleteAll(directory.c.Name, directory.path)
 	}
-
+	
 	directoryCache.Delete(directory.c.Name, d.path, directory.name)
 
 	return nil
@@ -380,6 +441,40 @@ func (d *Directory) removeSymlink(symlink *Symlink, name, path string) error {
 	return nil
 }
 
+//
+//Uc Add - fix rename Dir - 3/1/2017
+//
+
+func (d *Directory) Mkdir2(Name string) (fs.Node, error) {
+	absPath := d.path + Name + "/"
+
+	// Create the file in swift
+	if TransferMode&SkipMkdir == 0 {
+		if err := SwiftConnection.ObjectPutBytes(d.c.Name, absPath, nil, dirContentType); err != nil {
+			return nil, fuse.EIO
+		}
+	}
+	fmt.Println("creat new dir MK2: "+absPath)
+	// Directory object
+	node := &Directory{
+		c:    d.c,
+		cs:   d.cs,
+		name: Name,
+		path: absPath,
+		sh:   swift.Headers{},
+		so: &swift.Object{
+			Name:         absPath,
+			ContentType:  dirContentType,
+			LastModified: time.Now(),
+		},
+	}
+
+	// Cache eviction
+	directoryCache.Set(d.c.Name, d.path, Name, node)
+
+	return node, nil
+}
+
 // Rename moves a node from its current directory to a new directory and updates the cache.
 func (d *Directory) Rename(ctx context.Context, req *fuse.RenameRequest, newDir fs.Node) error {
 	if t, ok := newDir.(*Directory); ok && (t.c.Name == d.c.Name) {
@@ -390,10 +485,17 @@ func (d *Directory) Rename(ctx context.Context, req *fuse.RenameRequest, newDir 
 		if oldObject, ok := oldNode.(*Object); ok {
 			return oldObject.rename(t, req.NewName)
 		}
-
 		if oldSymlink, ok := oldNode.(*Symlink); ok {
 			return oldSymlink.rename(t, req.NewName)
 		}
+		if oldDir, ok := oldNode.(*Directory); ok{
+                if ok, _ := oldDir.isEmpty(); ok{
+                        d.Mkdir2(req.NewName)
+                        fmt.Println("Rename - creat new dir ok "+req.NewName)
+                        return d.removeDirectory(oldDir,oldDir.name)
+                }
+        }
+
 	}
 	return fuse.ENOTSUP
 }
