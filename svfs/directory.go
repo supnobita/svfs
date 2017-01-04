@@ -57,7 +57,8 @@ func (d *Directory) Attr(ctx context.Context, a *fuse.Attr) error {
 func (d *Directory) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (fs.Node, fs.Handle, error) {
 	// Create an empty object in swift
 	path := d.path + req.Name
-
+	
+	fmt.println("file path: "+path)
 	// New node
 	node := &Object{name: req.Name, path: path, c: d.c, cs: d.cs, p: d}
 
@@ -399,7 +400,9 @@ func (d *Directory) removeDirectory(directory *Directory, name string) error {
 	
 	//End Uc Add - fix rename Dir - 3/1/2017
 	
-	SwiftConnection.ObjectDelete(directory.c.Name, directory.so.Name)
+	if err := SwiftConnection.ObjectDelete(directory.c.Name, directory.so.Name); err != nil {
+		return fuse.EIO
+	}
 	//directoryCache.DeleteAll(directory.c.Name, directory.path)
 	
 	if _, found := directoryCache.Peek(directory.c.Name, directory.path); found {
@@ -490,9 +493,10 @@ func (d *Directory) Rename(ctx context.Context, req *fuse.RenameRequest, newDir 
 		}
 		if oldDir, ok := oldNode.(*Directory); ok{
                 if ok, _ := oldDir.isEmpty(); ok{
-                        d.Mkdir2(req.NewName)
-                        fmt.Println("Rename - creat new dir ok "+req.NewName)
-                        return d.removeDirectory(oldDir,oldDir.name)
+                        if _,err := d.Mkdir2(req.NewName); !err {
+							fmt.Println("Rename - creat new dir ok "+req.NewName)
+							return d.removeDirectory(oldDir,oldDir.name)
+						}
                 }
         }
 
